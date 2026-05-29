@@ -358,6 +358,14 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.slot_mapping = torch.zeros(
             (vllm_config.scheduler_config.max_num_batched_tokens, 2), dtype=torch.int32, device=self.device
         )
+        self.a5_decode_slot_mapping = None
+        if get_ascend_device_type() in {AscendDeviceType.A5}:
+            self.a5_decode_slot_mapping = torch.full(
+                (vllm_config.scheduler_config.max_num_batched_tokens,),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            )
 
     @classmethod
     def get_cudagraph_support(
@@ -621,24 +629,10 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             compress_cos = self.prefill_ratio_to_sas_metadata[f"c{self.compressor_ratio}_cos"]
             compress_sin = self.prefill_ratio_to_sas_metadata[f"c{self.compressor_ratio}_sin"]
 
-        if self.prefill_ratio_to_sas_metadata.get(f"compressed_c{self.compressor_ratio}_tokens_start", None) is None:
-            decode_input_positions = input_positions[:tokens_start]
-            compressed_tokens_start, compressed_tokens_end = _get_compressed_decode_token_start_and_end(
-                decode_input_positions, self.compressor_ratio
-            )
-            self.prefill_ratio_to_sas_metadata[f"compressed_c{self.compressor_ratio}_tokens_start"] = (
-                compressed_tokens_start
-            )
-            self.prefill_ratio_to_sas_metadata[f"compressed_c{self.compressor_ratio}_tokens_ebd"] = (
-                compressed_tokens_end
-            )
-        else:
-            compressed_tokens_start = self.prefill_ratio_to_sas_metadata[
-                f"compressed_c{self.compressor_ratio}_tokens_start"
-            ]
-            compressed_tokens_end = self.prefill_ratio_to_sas_metadata[
-                f"compressed_c{self.compressor_ratio}_tokens_ebd"
-            ]
+        decode_input_positions = input_positions[:tokens_start]
+        compressed_tokens_start, compressed_tokens_end = _get_compressed_decode_token_start_and_end(
+            decode_input_positions, self.compressor_ratio
+        )
 
         prefill_slot_mapping = self.slot_mapping[
             compressed_tokens_start : compressed_tokens_end + compressed_tokens_start
@@ -795,54 +789,30 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         num_reqs_actual: int | None,
     ) -> AscendDSADecodeMetadata:
         assert self.decode_ratio_to_sas_metadata is not None
-        if self.decode_ratio_to_sas_metadata.get("query_start_loc", None) is None:
-            query_start_loc = common_attn_metadata.query_start_loc[: self.num_decodes + 1]
-            self.decode_ratio_to_sas_metadata["query_start_loc"] = query_start_loc
-            input_positions = common_attn_metadata.positions[: self.num_decode_tokens].long()
-            self.decode_ratio_to_sas_metadata["input_positions"] = input_positions
-            cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=True)
-            self.decode_ratio_to_sas_metadata["cos"] = cos
-            self.decode_ratio_to_sas_metadata["sin"] = sin
+        query_start_loc = common_attn_metadata.query_start_loc[: self.num_decodes + 1]
+        input_positions = common_attn_metadata.positions[: self.num_decode_tokens].long()
+        cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=True)
 
-            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: self.num_decodes + 1]
-            input_positions_cpu = common_attn_metadata.positions_cpu[: self.num_decode_tokens].long()
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: self.num_decodes + 1]
+        input_positions_cpu = common_attn_metadata.positions_cpu[: self.num_decode_tokens].long()
 
-            # Prefer _seq_lens_cpu (always available, updated during draft
-            # iterations) over seq_lens_cpu (None in async spec decode mode).
-            if common_attn_metadata._seq_lens_cpu is not None:
-                _seq_lens_cpu = common_attn_metadata._seq_lens_cpu
-            elif common_attn_metadata.seq_lens_cpu is not None:
-                _seq_lens_cpu = common_attn_metadata.seq_lens_cpu
-            else:
-                _seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
-            max_seq_lens = _seq_lens_cpu[: self.num_decodes].max().item()
-            decode_input_positions = input_positions_cpu
-            seq_lens_list = _seq_lens_cpu[: self.num_decodes].tolist()
-            self.decode_ratio_to_sas_metadata["query_start_loc_cpu"] = query_start_loc_cpu
-            self.decode_ratio_to_sas_metadata["decode_input_positions"] = decode_input_positions
-            self.decode_ratio_to_sas_metadata["max_seq_lens"] = max_seq_lens
-            self.decode_ratio_to_sas_metadata["seq_lens_list"] = seq_lens_list
-
-            max_seqlen_kv = torch.max(_seq_lens_cpu[: self.num_decodes]).item()
-            max_seqlen_q = torch.max(query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).item()
-            self.decode_ratio_to_sas_metadata["max_seqlen_kv"] = max_seqlen_kv
-            self.decode_ratio_to_sas_metadata["max_seqlen_q"] = max_seqlen_q
-
-            seq_lens_q = query_start_loc[1:] - query_start_loc[:-1]
-            start_pos_decode = self.seq_lens[: self.num_decodes] - seq_lens_q
-            self.decode_ratio_to_sas_metadata["start_pos_decode"] = start_pos_decode
+        # Prefer _seq_lens_cpu (always available, updated during draft
+        # iterations) over seq_lens_cpu (None in async spec decode mode).
+        if common_attn_metadata._seq_lens_cpu is not None:
+            _seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+        elif common_attn_metadata.seq_lens_cpu is not None:
+            _seq_lens_cpu = common_attn_metadata.seq_lens_cpu
         else:
-            query_start_loc = self.decode_ratio_to_sas_metadata["query_start_loc"]
-            input_positions = self.decode_ratio_to_sas_metadata["input_positions"]
-            cos = self.decode_ratio_to_sas_metadata["cos"]
-            sin = self.decode_ratio_to_sas_metadata["sin"]
-            query_start_loc_cpu = self.decode_ratio_to_sas_metadata["query_start_loc_cpu"]
-            decode_input_positions = self.decode_ratio_to_sas_metadata["decode_input_positions"]
-            max_seq_lens = self.decode_ratio_to_sas_metadata["max_seq_lens"]
-            seq_lens_list = self.decode_ratio_to_sas_metadata["seq_lens_list"]
-            max_seqlen_kv = self.decode_ratio_to_sas_metadata["max_seqlen_kv"]
-            max_seqlen_q = self.decode_ratio_to_sas_metadata["max_seqlen_q"]
-            start_pos_decode = self.decode_ratio_to_sas_metadata["start_pos_decode"]
+            _seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
+        max_seq_lens = _seq_lens_cpu[: self.num_decodes].max().item()
+        decode_input_positions = input_positions_cpu
+        seq_lens_list = _seq_lens_cpu[: self.num_decodes].tolist()
+
+        max_seqlen_kv = torch.max(_seq_lens_cpu[: self.num_decodes]).item()
+        max_seqlen_q = torch.max(query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).item()
+
+        seq_lens_q = query_start_loc[1:] - query_start_loc[:-1]
+        start_pos_decode = self.seq_lens[: self.num_decodes] - seq_lens_q
 
         block_table_size = self.get_block_table_size(common_attn_metadata, BUILD_METADATA_STEP_DECODE)
 
@@ -861,20 +831,14 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             return gpu_pad_positions
 
         layer_name = f"c{self.compressor_ratio}"
-        if self.decode_ratio_to_sas_metadata.get(layer_name + "_cos", None) is None:
-            compress_cos, compress_sin = get_cos_and_sin_dsa(
-                {
-                    layer_name: _get_padded_compressed_position(
-                        decode_input_positions, self.compressor_ratio, input_positions.device
-                    )
-                },
-                use_cache=True,
-            )
-            self.decode_ratio_to_sas_metadata[layer_name + "_cos"] = compress_cos
-            self.decode_ratio_to_sas_metadata[layer_name + "_sin"] = compress_sin
-        else:
-            compress_cos = self.decode_ratio_to_sas_metadata[layer_name + "_cos"]
-            compress_sin = self.decode_ratio_to_sas_metadata[layer_name + "_sin"]
+        compress_cos, compress_sin = get_cos_and_sin_dsa(
+            {
+                layer_name: _get_padded_compressed_position(
+                    decode_input_positions, self.compressor_ratio, input_positions.device
+                )
+            },
+            use_cache=True,
+        )
 
         def _get_compressed_decode_token_start(decode_input_positions, compress_ratio):
             # Note(qcs): some models use compress_ratio=0 as non-compression tag.
@@ -884,30 +848,29 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             compressed_decode_num = mask.sum().item()
             return compressed_decode_num
 
-        if self.decode_ratio_to_sas_metadata.get("compressed_tokens_start_" + str(self.compressor_ratio), None) is None:
-            compressed_tokens_start = _get_compressed_decode_token_start(decode_input_positions, self.compressor_ratio)
-            self.decode_ratio_to_sas_metadata["compressed_tokens_start_" + str(self.compressor_ratio)] = (
-                compressed_tokens_start
-            )
-        else:
-            compressed_tokens_start = self.decode_ratio_to_sas_metadata[
-                "compressed_tokens_start_" + str(self.compressor_ratio)
-            ]
-
-        slot_mapping = self.slot_mapping[:compressed_tokens_start]
+        compressed_tokens_start = _get_compressed_decode_token_start(decode_input_positions, self.compressor_ratio)
 
         tmp_compressor_ration = self.compressor_ratio if self.compressor_ratio != 0 else 1
         target_shape = min(
             self.num_decode_tokens,
             self.num_decode_tokens // tmp_compressor_ration + self.num_decodes)
-        pad_size = target_shape - slot_mapping.shape[0]
-        if pad_size > 0:
-            if slot_mapping.ndim == 1:
-                slot_mapping = F.pad(slot_mapping, (0, pad_size), value=-1)
-            else:
-                slot_mapping = F.pad(slot_mapping, (0, 0, 0, pad_size), value=-1)
+        if get_ascend_device_type() in {AscendDeviceType.A5}:
+            assert self.a5_decode_slot_mapping is not None
+            slot_mapping = self.a5_decode_slot_mapping[:target_shape]
+            slot_mapping.fill_(-1)
+            valid_slot_mapping_len = min(compressed_tokens_start, target_shape)
+            if valid_slot_mapping_len > 0:
+                slot_mapping[:valid_slot_mapping_len].copy_(self.slot_mapping[:valid_slot_mapping_len])
         else:
-            slot_mapping = slot_mapping[:target_shape]
+            slot_mapping = self.slot_mapping[:compressed_tokens_start]
+            pad_size = target_shape - slot_mapping.shape[0]
+            if pad_size > 0:
+                if slot_mapping.ndim == 1:
+                    slot_mapping = F.pad(slot_mapping, (0, pad_size), value=-1)
+                else:
+                    slot_mapping = F.pad(slot_mapping, (0, 0, 0, pad_size), value=-1)
+            else:
+                slot_mapping = slot_mapping[:target_shape]
 
         assert self.start_pos_decode is not None
         self.start_pos_decode.fill_(0)
@@ -1497,6 +1460,8 @@ class AscendDSAImpl(DSAAttentionImpl):
         cos = attn_metadata[0].cos[layer_name]  # type: ignore[index]
         sin = attn_metadata[0].sin[layer_name]  # type: ignore[index]
         num_tokens = o_proj_input.shape[0]
+        if actual_tokens < num_tokens:
+            o_proj_input[actual_tokens:].zero_()
 
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             o_proj_input.unsqueeze(1),
